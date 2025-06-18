@@ -6,24 +6,9 @@ const YTDlpWrap = require('yt-dlp-wrap').default;
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const config = require('../config.js');
+const axios = require('axios'); // Nous n'avons besoin que d'axios
 
-// --- SPOTIFY API SETUP ---
-const SpotifyWebApi = require('spotify-web-api-node');
-const spotifyApi = new SpotifyWebApi({ clientId: config.SPOTIFY_CLIENT_ID, clientSecret: config.SPOTIFY_CLIENT_SECRET });
-async function refreshSpotifyToken() {
-    try {
-        const data = await spotifyApi.clientCredentialsGrant();
-        console.log('[INFO] Spotify access token has been successfully retrieved/refreshed.');
-        spotifyApi.setAccessToken(data.body['access_token']);
-    } catch (err) {
-        console.error('CRITICAL: Could not retrieve Spotify access token. Please check credentials.', err);
-    }
-}
-refreshSpotifyToken();
-setInterval(refreshSpotifyToken, 3500 * 1000);
-// --- END OF SPOTIFY API SETUP ---
-
+// --- PLUS BESOIN DE SPOTIFY API OU PUPPETEER ICI ---
 
 const executableName = os.platform() === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 const ytDlpPath = path.join(process.cwd(), 'node_modules', 'yt-dlp-wrap', 'bin', executableName);
@@ -45,14 +30,40 @@ function withTimeout(promise, ms) {
     return Promise.race([promise, timeoutPromise]);
 }
 
-const EMOJI_PROCESSING = '⚙️', EMOJI_DOWNLOAD = '📥', EMOJI_LINK = '🔗', EMOJI_INFO = 'ℹ️', EMOJI_SPOTIFY = '<:spotify:123456>', EMOJI_YOUTUBE = '<:youtube:123456>';
+const EMOJI_PROCESSING = '⚙️', EMOJI_DOWNLOAD = '📥', EMOJI_LINK = '🔗', EMOJI_INFO = 'ℹ️';
+
+// --- NOUVELLE FONCTION UNIVERSELLE UTILISANT L'API ODESLI ---
+async function getMusicMetadata(url) {
+    try {
+        console.log(`[API] Fetching metadata for ${url} from Odesli API...`);
+        const encodedUrl = encodeURIComponent(url);
+        const apiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodedUrl}`;
+        const { data } = await axios.get(apiUrl);
+
+        const songData = data.entitiesByUniqueId[data.entityUniqueId];
+        const songTitle = songData.title;
+        const songArtists = songData.artistName;
+
+        if (songTitle && songArtists) {
+            console.log(`[API] Found: ${songTitle} by ${songArtists}`);
+            return { songTitle, songArtists };
+        }
+        return null;
+    } catch (error) {
+        console.error('Error fetching metadata from Odesli API:', error.message);
+        return null;
+    }
+}
+
 
 module.exports = {
     name: Events.MessageCreate,
     async execute(message) {
         if (message.author.bot || !message.guild) return;
+        
         const serverConfig = await Server.findOne({ where: { guildId: message.guild.id } });
         if (!serverConfig || serverConfig.channelId !== message.channel.id) return;
+        
         const urlRegex = /(https?:\/\/[^\s]+)/g;
         const urls = message.content.match(urlRegex);
         if (!urls) return;
@@ -66,55 +77,37 @@ module.exports = {
             console.log(`\n[STEP 1/5] Received request for URL: ${sourceUrl}`);
             await message.channel.sendTyping();
             
-            let metadataSourceUrl = sourceUrl;
-            // This regex will find and reject common unwanted video types
-            const rejectTitleRegex = 'reaction|cover|remix|live|tutorial|instrumental|karaoke|parody';
+            statusEmbed.setDescription(`**[1/4]** ${EMOJI_LINK} Analyzing link...`);
+            processingMessage = await message.reply({ embeds: [statusEmbed] });
 
-            if (sourceUrl.includes('spotify.com')) {
-                console.log('[INFO] Spotify link detected. Using Official Spotify API.');
-                statusEmbed.setDescription(`**[1/4]** ${EMOJI_SPOTIFY} Spotify link found, searching...`);
-                processingMessage = await message.reply({ embeds: [statusEmbed] });
-                const trackId = sourceUrl.split('track/')[1].split('?')[0];
-                const trackInfo = await spotifyApi.getTrack(trackId);
-                const songTitle = trackInfo.body.name;
-                
-                // --- IMPROVEMENT #1: Get ALL artists to make the search more precise ---
-                const songArtists = trackInfo.body.artists.map(artist => artist.name).join(' ');
-
-                const searchQuery = `ytsearch1:"${songTitle} ${songArtists}"`;
-                console.log(`[INFO] Created Youtube query: "${searchQuery}"`);
-                metadataSourceUrl = searchQuery;
-            } else if (sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be')) {
-                console.log('[INFO] YouTube link detected.');
-                statusEmbed.setDescription(`**[1/4]** ${EMOJI_YOUTUBE} YouTube link detected, processing...`);
-                processingMessage = await message.reply({ embeds: [statusEmbed] });
-            } else {
-                statusEmbed.setDescription(`**[1/4]** ${EMOJI_LINK} Processing link...`);
-                processingMessage = await message.reply({ embeds: [statusEmbed] });
+            const metadata = await getMusicMetadata(sourceUrl);
+            if (!metadata) {
+                throw new Error('Could not retrieve metadata for this link. It might be an unsupported service or a broken link.');
             }
+
+            const searchQuery = `ytsearch1:"${metadata.songTitle} - ${metadata.songArtists}"`;
+            console.log(`[INFO] Created YouTube query: "${searchQuery}"`);
             
-            console.log('[STEP 2/5] Fetching final metadata from source...');
+            console.log('[STEP 2/5] Fetching final video from source...');
             
             const metadataJson = await withTimeout(
                 ytDlpWrap.execPromise([
-                    metadataSourceUrl,
+                    searchQuery,
                     '--dump-json',
                     '--no-playlist',
                     '-f', 'best',
-                    // --- IMPROVEMENT #2: Reject unwanted titles to get the official song ---
-                    '--reject-title', rejectTitleRegex
                 ]),
                 20000
             );
-            const metadata = JSON.parse(metadataJson);
+            const ytMetadata = JSON.parse(metadataJson);
             
             statusEmbed.setDescription(`**[2/4]** ${EMOJI_INFO} Information found, starting download...`);
             await processingMessage.edit({ embeds: [statusEmbed] });
-            console.log(`[INFO] Found video: "${metadata.title}"`);
+            console.log(`[INFO] Found video: "${ytMetadata.title}"`);
             
-            const title = metadata.title || 'Unknown Title';
-            const finalUrl = metadata.webpage_url || sourceUrl;
-            const thumbnail = metadata.thumbnail || null;
+            const title = ytMetadata.title || 'Unknown Title';
+            const finalUrl = ytMetadata.webpage_url || sourceUrl;
+            const thumbnail = ytMetadata.thumbnail || null;
             
             const tempDir = os.tmpdir();
             const safeTitle = title.replace(/[^a-z0-9\s-]/gi, '_').substring(0, 50).trim();
@@ -122,9 +115,8 @@ module.exports = {
             
             console.log('[STEP 3/5] Starting download and conversion...');
             await new Promise((resolve, reject) => {
-                // We use the direct URL of the video we found to be precise
                 const ytDlpProcess = ytDlpWrap.exec([
-                    metadata.webpage_url, 
+                    ytMetadata.webpage_url, 
                     '-x', '--audio-format', 'mp3', '--audio-quality', '5',
                     '--postprocessor-args', 'ffmpeg:-preset ultrafast',
                     '--no-playlist',
